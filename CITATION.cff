@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: >-
+  Simulation suite for advanced exergy and 4E analysis of waste heat
+  recovery from a low-speed two-stroke marine diesel with an ORC bottoming
+  cycle in tropical seawater
+message: >-
+  If you use this software or data, please cite both the software (this
+  record) and the associated paper once published.
+type: software
+authors:
+  - given-names: Prajwal
+    family-names: Rao
+    orcid: 'https://orcid.org/0009-0004-2470-3656'
+    affiliation: Independent researcher, Chennai, India
+keywords:
+  - waste heat recovery
+  - organic Rankine cycle
+  - advanced exergy analysis
+  - marine diesel engine
+  - tropical seawater
+  - MAN B&W S65ME-C
+license: MIT

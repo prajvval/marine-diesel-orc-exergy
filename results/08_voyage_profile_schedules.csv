@@ -1,0 +1,9 @@
+profile,phase,hours_per_week,weight_frac,engine_load_pct,whr_active
+Indian_coastal,port,48.0,0.2857142857142857,0.0,False
+Indian_coastal,maneuvering,8.0,0.047619047619047616,30.0,True
+Indian_coastal,coastal,72.0,0.42857142857142855,65.0,True
+Indian_coastal,open_ocean,40.0,0.23809523809523808,80.0,True
+Long_haul_PG_SGP,port,16.0,0.09523809523809523,0.0,False
+Long_haul_PG_SGP,maneuvering,4.0,0.023809523809523808,30.0,True
+Long_haul_PG_SGP,coastal,13.6,0.08095238095238096,65.0,True
+Long_haul_PG_SGP,open_ocean,134.4,0.8,80.0,True
