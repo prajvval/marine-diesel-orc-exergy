@@ -1,0 +1,406 @@
+"""
+Module 7: Advanced Exergy Decomposition (Kelly-Tsatsaronis-Morosuk)
+====================================================================
+Splits component exergy destruction into (Avoidable/Unavoidable) ×
+(Endogenous/Exogenous) = 4 bins for the engine + WHR system, isolating
+the component-level improvement potential that conventional (first-level)
+exergy analysis cannot.
+
+Theoretical-cycle method:
+  - E_D_UN     : from a "realistic-unavoidable" operating state with
+                 near-ideal component parameters (eta_isen_turbine=0.92,
+                 eta_isen_pump=0.95, HX pinch=2 K, lossless combustor).
+  - E_D_AV     : E_D_real - E_D_UN
+  - E_D_EN     : run cycle with all OTHER components at ideal and THIS
+                 component at its real irreversibility. The destruction
+                 that remains is endogenous (attributable to component
+                 alone, independent of the rest of the system).
+  - E_D_EX     : E_D_real - E_D_EN
+
+Components analysed: engine cylinder combustion, turbocharger, exhaust
+gas boiler (interface HX), ORC evaporator, ORC turbine, ORC condenser,
+ORC pump.
+
+Load points: 50%, 75%, 85%, 100% MCR.
+
+References
+----------
+Tsatsaronis, G. (2002). Strengths and limitations of exergy analysis.
+    Energy Conversion and Management, 43(9-12), 1257-1267.
+    doi:10.1016/S0196-8904(02)00012-2
+
+Kelly, S., Tsatsaronis, G., & Morosuk, T. (2009). Advanced exergetic
+    analysis: Approaches for splitting the exergy destruction into
+    endogenous and exogenous parts. Energy, 34(3), 384-391.
+    doi:10.1016/j.energy.2008.12.007
+
+Morosuk, T., & Tsatsaronis, G. (2019). Advanced exergy-based methods
+    used to understand and improve energy-conversion systems.
+    Energy, 169, 238-246. doi:10.1016/j.energy.2018.12.023
+
+Author: Prajwal Rao
+"""
+
+from __future__ import annotations
+
+import os
+import numpy as np
+import pandas as pd
+import CoolProp.CoolProp as CP
+
+from engine_model import S65MEC_Engine
+
+
+# --------------------------------------------------------------------------
+# Component-level "real" vs "unavoidable" parameter definitions.
+# The unavoidable column represents the best realistically attainable state
+# (Tsatsaronis 2002), NOT the thermodynamic ideal. The gap between real
+# and unavoidable is what engineering can actually remove.
+# --------------------------------------------------------------------------
+COMPONENT_PARAMS = {
+    # Engine cylinder combustion (REVISED 2026-06-13):
+    #   Destruction is computed from a FULL whole-engine exergy balance
+    #   (fuel exergy - shaft work - exergy of all heat-rejection streams),
+    #   NOT the previous Ex_fuel*(1-eta)-W_brake form, which double-counted
+    #   shaft work and clamped the unavoidable case to zero (a ~13x error
+    #   that made combustion look 100% avoidable). See _engine_side_destruction.
+    #   - eta_real = 0.0 is a sentinel meaning "use the engine's actual brake
+    #     thermal efficiency at this load" (~0.50-0.51).
+    #   - eta_unav = 0.54 is the best realistically attainable bare two-stroke
+    #     brake efficiency (state-of-the-art ~2024 large bore, low-NOx,
+    #     improved insulation). The destruction remaining at that state is the
+    #     UNAVOIDABLE combustion/gas-exchange destruction (the bulk of it).
+    "engine_cylinder":  {"eta_real": 0.0, "eta_unav": 0.54},
+    # Turbocharger (combined T+C stage):
+    "turbocharger":     {"eta_real": 0.78, "eta_unav": 0.88},
+    # Exhaust gas boiler (interface HX between exhaust and ORC evaporator):
+    "exhaust_boiler":   {"pinch_real_K": 20.0, "pinch_unav_K": 5.0},
+    # ORC evaporator:
+    "orc_evaporator":   {"pinch_real_K": 10.0, "pinch_unav_K": 2.0},
+    # ORC turbine:
+    "orc_turbine":      {"eta_real": 0.80, "eta_unav": 0.92},
+    # ORC condenser:
+    "orc_condenser":    {"pinch_real_K": 9.0,  "pinch_unav_K": 3.0},
+    # ORC pump:
+    "orc_pump":         {"eta_real": 0.70, "eta_unav": 0.95},
+}
+
+TARGET_LOADS = [0.50, 0.75, 0.85, 1.00]
+REFERENCE_FLUID = "Toluene"  # REVISED 2026-06-13: match the paper's hero fluid
+PHI_HFO = 1.06               # HFO chemical exergy / LHV
+
+
+# --------------------------------------------------------------------------
+# Exergy of sensible-heat / isothermal reject streams relative to dead state.
+# --------------------------------------------------------------------------
+def _carnot_stream_exergy(Q_kW: float, T_hot_K: float, T0_K: float) -> float:
+    """Exergy of a stream cooling from T_hot to the dead state (log-mean factor)."""
+    if T_hot_K <= T0_K:
+        return 0.0
+    dT = T_hot_K - T0_K
+    lm = 1.0 - T0_K * np.log(T_hot_K / T0_K) / dT
+    return Q_kW * max(lm, 0.0)
+
+
+def _isothermal_exergy(Q_kW: float, T_K: float, T0_K: float) -> float:
+    return Q_kW * max(1.0 - T0_K / T_K, 0.0)
+
+
+# --------------------------------------------------------------------------
+# Helper: solve a simple subcritical ORC with given component etas & pinch.
+# Returns dict of per-component exergy destruction in kW (steady state).
+# --------------------------------------------------------------------------
+def _solve_orc_destruction(Q_exh_kW: float, T_exh_C: float, T_sink_C: float,
+                           eta_pump: float, eta_turb: float,
+                           pinch_evap_K: float, pinch_cond_K: float,
+                           pinch_boiler_K: float,
+                           fluid: str = REFERENCE_FLUID,
+                           T0_K: float = 302.15) -> dict:
+    """
+    Solve a subcritical ORC under the given component irreversibility set
+    and return component-wise exergy destruction rates in kW.
+
+    Physics summary (constant-cp exhaust, saturated evap/cond):
+      E_D_comp = T0 * m_wf * (s_out - s_in) - Q_comp*(1 - T0/T_hot) etc.
+    We decompose into four cycle components plus the interface boiler.
+    """
+    T_cond_C = T_sink_C + pinch_cond_K
+    T_cond_K = T_cond_C + 273.15
+    # Evap temperature: exhaust-side pinch fixes upper bound.
+    T_evap_C = max(60.0, T_exh_C - pinch_boiler_K - pinch_evap_K)
+    # Stay subcritical for all fluids in our set (T_crit > 166 C typically)
+    T_crit_K = CP.PropsSI("Tcrit", fluid)
+    T_evap_K = min(T_evap_C + 273.15, T_crit_K - 5.0)
+    T_evap_C = T_evap_K - 273.15
+
+    # State 1: condenser outlet, saturated liquid
+    P_cond = CP.PropsSI("P", "T", T_cond_K, "Q", 0, fluid)
+    h1 = CP.PropsSI("H", "T", T_cond_K, "Q", 0, fluid)
+    s1 = CP.PropsSI("S", "T", T_cond_K, "Q", 0, fluid)
+
+    P_evap = CP.PropsSI("P", "T", T_evap_K, "Q", 1, fluid)
+    # State 2: pump outlet
+    h2s = CP.PropsSI("H", "P", P_evap, "S", s1, fluid)
+    h2 = h1 + (h2s - h1) / eta_pump
+    s2 = CP.PropsSI("S", "P", P_evap, "H", h2, fluid)
+
+    # State 3: evaporator outlet, saturated vapour (no superheat here)
+    h3 = CP.PropsSI("H", "T", T_evap_K, "Q", 1, fluid)
+    s3 = CP.PropsSI("S", "T", T_evap_K, "Q", 1, fluid)
+
+    # State 4: turbine outlet
+    h4s = CP.PropsSI("H", "P", P_cond, "S", s3, fluid)
+    h4 = h3 - eta_turb * (h3 - h4s)
+    s4 = CP.PropsSI("S", "P", P_cond, "H", h4, fluid)
+
+    q_in = h3 - h2
+    if q_in <= 0:
+        raise ValueError("q_in non-positive")
+    m_wf = Q_exh_kW * 1000.0 / q_in  # kg/s (Q_exh in kW -> W)
+
+    # Per-stream exergy destruction rates (W -> kW at the end)
+    # Pump:         E_D = T0 * m * (s2 - s1) = T0 * m * small
+    E_D_pump = T0_K * m_wf * (s2 - s1)
+    # Turbine:      E_D = T0 * m * (s4 - s3)
+    E_D_turb = T0_K * m_wf * (s4 - s3)
+    # Evaporator: exergy in from exhaust-side interface minus exergy gained by WF
+    # Exhaust cools from T_exh to T_exh_out = T_exh - Q/(m_exh*cp). For the
+    # endogenous/real split we assume fixed Q_exh; the destruction is
+    # T0*(m_wf*(s3 - s2) - Q_exh/T_lm_exh).
+    # Use log-mean temperature for the exhaust stream (Q = m_wf*(h3-h2)).
+    T_exh_out_C = max(150.0, T_exh_C - (h3 - h2) * m_wf / (50.0 * 1055.0))
+    T_exh_in_K = T_exh_C + 273.15
+    T_exh_out_K = T_exh_out_C + 273.15
+    dT_exh = T_exh_in_K - T_exh_out_K
+    if abs(dT_exh) > 1e-3:
+        carnot_exh = 1.0 - T0_K * np.log(T_exh_in_K / T_exh_out_K) / dT_exh
+    else:
+        carnot_exh = 1.0 - T0_K / T_exh_in_K
+    Ex_exh_in = Q_exh_kW * 1000.0 * carnot_exh
+    Ex_wf_gain = m_wf * ((h3 - h2) - T0_K * (s3 - s2))
+    E_D_evap = max(0.0, Ex_exh_in - Ex_wf_gain)
+    # Condenser: E_D = T0 * (m_wf*(s1 - s4) + Q_cond/T_sink)
+    #   Q_cond = m*(h4-h1).  Sink at T_sink (treated as isothermal seawater).
+    Q_cond = m_wf * (h4 - h1)
+    E_D_cond = T0_K * (m_wf * (s1 - s4) + Q_cond / (T_sink_C + 273.15))
+    E_D_cond = max(0.0, E_D_cond)
+    # Interface boiler (exhaust-gas to ORC hot side) lumps any
+    # additional pinch-driven irreversibility that lives between the
+    # engine and the ORC working-fluid circuit. Kept small for low pinch.
+    E_D_boiler = Q_exh_kW * T0_K * (pinch_boiler_K / (T_exh_in_K * (T_exh_in_K - pinch_boiler_K)))
+
+    W_net = m_wf * ((h3 - h4) - (h2 - h1)) / 1000.0  # kW
+
+    return {
+        "orc_pump_kW":       E_D_pump / 1000.0,
+        "orc_turbine_kW":    E_D_turb / 1000.0,
+        "orc_evaporator_kW": E_D_evap / 1000.0,
+        "orc_condenser_kW":  E_D_cond / 1000.0,
+        "exhaust_boiler_kW": E_D_boiler,
+        "W_net_kW":          W_net,
+        "m_wf_kg_s":         m_wf,
+        "T_evap_C":          T_evap_C,
+        "T_cond_C":          T_cond_C,
+    }
+
+
+def _engine_side_destruction(engine: S65MEC_Engine, load: float,
+                              cyl_eta: float, tc_eta: float,
+                              T0_K: float = 302.15) -> dict:
+    """Engine cylinder + turbocharger exergy destruction (REVISED 2026-06-13).
+
+    Uses a full whole-engine exergy balance instead of the previous
+    Ex_fuel*(1-eta) - W_brake form (which double-counted shaft work and
+    produced a ~13x under-estimate with a zero unavoidable part):
+
+        E_D_engine = Ex_fuel - W_brake - sum(exergy of reject heat streams)
+
+    where the reject streams are the post-turbocharger exhaust, jacket water,
+    charge-air cooler, lube-oil cooler and surface radiation, each weighted by
+    its own Carnot/temperature factor relative to the dead state. The
+    turbocharger destruction is then attributed from the post-TC exhaust
+    exergy and the T/C efficiency, and SUBTRACTED from the engine total so the
+    two components do not double-count.
+
+    cyl_eta is interpreted as the brake thermal efficiency to impose:
+      * cyl_eta <= 0  -> use the engine's ACTUAL brake efficiency (real case);
+      * cyl_eta  > 0  -> impose that brake efficiency (best-in-class = the
+                         "unavoidable" reference state).
+    """
+    T0_C = T0_K - 273.15
+    Q_fuel = float(engine.fuel_energy_input(load))
+    Ex_fuel = Q_fuel * PHI_HFO
+    if cyl_eta and cyl_eta > 0:
+        W_brake = cyl_eta * Q_fuel                       # imposed best-in-class
+    else:
+        W_brake = float(engine.brake_power(load))        # actual
+
+    # Heat-rejection streams (energy, kW) with representative reject temps (K).
+    Q_exh = float(engine.exhaust_heat(load, T_ref_C=T0_C))   # post-T/C, above dead state
+    T_exh_C = float(engine.exhaust_gas_temp_after_TC(load))
+    T_exh_K = T_exh_C + 273.15
+    Q_jac = float(engine.jacket_water_heat(load));  T_jac_K = 85.0 + 273.15
+    Q_chg = float(engine.charge_air_heat(load));    T_chg_K = 130.0 + 273.15  # glide repr. mean
+    Q_lub = float(engine.lube_oil_heat(load));      T_lub_K = 60.0 + 273.15
+    Q_rad = float(engine.radiation_loss(load));     T_rad_K = 50.0 + 273.15
+
+    Ex_exh = _carnot_stream_exergy(Q_exh, T_exh_K, T0_K)
+    Ex_heat = (Ex_exh
+               + _isothermal_exergy(Q_jac, T_jac_K, T0_K)
+               + _carnot_stream_exergy(Q_chg, T_chg_K, T0_K)
+               + _isothermal_exergy(Q_lub, T_lub_K, T0_K)
+               + _isothermal_exergy(Q_rad, T_rad_K, T0_K))
+
+    E_D_engine_total = max(Ex_fuel - W_brake - Ex_heat, 0.0)
+
+    # Turbocharger: irreversibility carried by the post-T/C exhaust exergy at
+    # finite T/C efficiency. Subtract from the engine total to avoid double count.
+    E_D_tc = Ex_exh * (1.0 - tc_eta)
+    E_D_cyl = max(E_D_engine_total - E_D_tc, 0.0)
+
+    return {
+        "engine_cylinder_kW":  E_D_cyl,
+        "turbocharger_kW":     E_D_tc,
+        "Q_exh_available_kW":  Q_exh,
+        "T_exh_C":             T_exh_C,
+    }
+
+
+# --------------------------------------------------------------------------
+# Endogenous/exogenous split: for each component, run cycle with only that
+# component at its real eta (all others at unavoidable). The resulting
+# component destruction is endogenous.
+# --------------------------------------------------------------------------
+COMPONENTS = [
+    "engine_cylinder", "turbocharger", "exhaust_boiler",
+    "orc_evaporator", "orc_turbine", "orc_condenser", "orc_pump",
+]
+
+
+def _config_for(case: str) -> dict:
+    """Build the parameter set used in each case (all real, all unav, or
+    one-component-real-rest-unav for endogenous evaluation)."""
+    cfg = {}
+    for comp, params in COMPONENT_PARAMS.items():
+        real = case in ("real", comp)
+        out = {}
+        if "eta_real" in params:
+            out["eta"] = params["eta_real"] if real else params["eta_unav"]
+        if "pinch_real_K" in params:
+            out["pinch"] = params["pinch_real_K"] if real else params["pinch_unav_K"]
+        cfg[comp] = out
+    return cfg
+
+
+def _destruction_set(engine: S65MEC_Engine, load: float, case: str,
+                     T_sw_C: float = 29.0) -> dict:
+    """Compute all component E_D values under the given case label."""
+    cfg = _config_for(case)
+    T0_K = T_sw_C + 273.15
+    eng = _engine_side_destruction(
+        engine, load,
+        cyl_eta=cfg["engine_cylinder"]["eta"],
+        tc_eta=cfg["turbocharger"]["eta"],
+        T0_K=T0_K,
+    )
+    orc = _solve_orc_destruction(
+        Q_exh_kW=eng["Q_exh_available_kW"],
+        T_exh_C=eng["T_exh_C"],
+        T_sink_C=T_sw_C,
+        eta_pump=cfg["orc_pump"]["eta"],
+        eta_turb=cfg["orc_turbine"]["eta"],
+        pinch_evap_K=cfg["orc_evaporator"]["pinch"],
+        pinch_cond_K=cfg["orc_condenser"]["pinch"],
+        pinch_boiler_K=cfg["exhaust_boiler"]["pinch"],
+        T0_K=T0_K,
+    )
+    return {
+        "engine_cylinder":  eng["engine_cylinder_kW"],
+        "turbocharger":     eng["turbocharger_kW"],
+        "exhaust_boiler":   orc["exhaust_boiler_kW"],
+        "orc_evaporator":   orc["orc_evaporator_kW"],
+        "orc_turbine":      orc["orc_turbine_kW"],
+        "orc_condenser":    orc["orc_condenser_kW"],
+        "orc_pump":         orc["orc_pump_kW"],
+        "W_net_kW":         orc["W_net_kW"],
+    }
+
+
+def advanced_decomposition(engine: S65MEC_Engine, loads: list) -> pd.DataFrame:
+    """Run the full advanced exergy decomposition for each (load, component)."""
+    rows = []
+    for load in loads:
+        D_real = _destruction_set(engine, load, case="real")
+        D_unav = _destruction_set(engine, load, case="unav")
+        # Endogenous: one-component-real, all others unavoidable
+        D_endo_per_comp = {
+            c: _destruction_set(engine, load, case=c)[c] for c in COMPONENTS
+        }
+        for c in COMPONENTS:
+            ed_real = D_real[c]
+            ed_unav = min(D_unav[c], ed_real)
+            ed_av = max(ed_real - ed_unav, 0.0)
+            ed_endo = min(D_endo_per_comp[c], ed_real)
+            ed_exo = max(ed_real - ed_endo, 0.0)
+            # Cross split
+            frac_av = ed_av / ed_real if ed_real > 1e-6 else 0.0
+            frac_endo = ed_endo / ed_real if ed_real > 1e-6 else 0.0
+            ed_av_en = ed_real * frac_av * frac_endo
+            ed_av_ex = ed_av - ed_av_en
+            ed_un_en = ed_unav * frac_endo
+            ed_un_ex = ed_unav - ed_un_en
+            rows.append({
+                "Load_pct":              load * 100.0,
+                "Component":             c,
+                "E_D_total_kW":          ed_real,
+                "E_D_avoidable_kW":      ed_av,
+                "E_D_unavoidable_kW":    ed_unav,
+                "E_D_endogenous_kW":     ed_endo,
+                "E_D_exogenous_kW":      ed_exo,
+                "E_D_AV_EN_kW":          ed_av_en,
+                "E_D_AV_EX_kW":          ed_av_ex,
+                "E_D_UN_EN_kW":          ed_un_en,
+                "E_D_UN_EX_kW":          ed_un_ex,
+                "improvement_potential_kW": ed_av_en,  # AV+EN = self-fixable
+            })
+    return pd.DataFrame(rows)
+
+
+def component_ranking(df: pd.DataFrame) -> pd.DataFrame:
+    """Rank components by avoidable-endogenous destruction at 85% MCR
+    (the service operating point). Higher AV_EN = best ROI for redesign."""
+    sub = df[df["Load_pct"].round(1) == 85.0].copy()
+    sub = sub.sort_values("improvement_potential_kW", ascending=False)
+    sub = sub.reset_index(drop=True)
+    sub["rank"] = np.arange(1, len(sub) + 1)
+    total_av_en = sub["improvement_potential_kW"].sum()
+    sub["share_pct"] = 100.0 * sub["improvement_potential_kW"] / total_av_en
+    return sub[["rank", "Component", "E_D_total_kW", "improvement_potential_kW",
+                "E_D_AV_EN_kW", "E_D_AV_EX_kW", "share_pct"]]
+
+
+def main(output_dir: str = "results") -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    engine = S65MEC_Engine(ambient_temp_C=30, seawater_temp_C=29)
+    np.random.seed(42)
+
+    df = advanced_decomposition(engine, TARGET_LOADS)
+    path_main = os.path.join(output_dir, "07_advanced_exergy_decomposition.csv")
+    df.to_csv(path_main, index=False)
+
+    rank = component_ranking(df)
+    path_rank = os.path.join(output_dir, "07b_component_improvement_ranking.csv")
+    rank.to_csv(path_rank, index=False)
+
+    print(f"[Advanced Exergy] Decomposition for {len(TARGET_LOADS)} loads × "
+          f"{len(COMPONENTS)} components = {len(df)} rows")
+    print(f"[Advanced Exergy] Saved to {path_main}")
+    print(f"[Advanced Exergy] Saved ranking to {path_rank}")
+    print("\n[Advanced Exergy] Top 3 improvement targets at 85% MCR:")
+    for _, r in rank.head(3).iterrows():
+        print(f"  {r['rank']}. {r['Component']:20s}  AV_EN={r['E_D_AV_EN_kW']:7.1f} kW  "
+              f"share={r['share_pct']:5.1f}%")
+
+
+if __name__ == "__main__":
+    main()

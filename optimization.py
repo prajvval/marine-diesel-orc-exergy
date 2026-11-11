@@ -284,9 +284,15 @@ def run_nsga2_optimization(engine, output_dir='results', n_gen=200, pop_size=100
         import CoolProp.CoolProp as CP
         from orc_model import ORCSystem
 
-        fluids = ['R245fa', 'R1233zd(E)', 'R1234ze(E)', 'n-Pentane']
-        fluid_gwp = {'R245fa': 1030, 'R1233zd(E)': 4.5, 'R1234ze(E)': 7, 'n-Pentane': 5}
-        fluid_capex = {'R245fa': 2500, 'R1233zd(E)': 2400, 'R1234ze(E)': 2600, 'n-Pentane': 2200}
+        # Full candidate set — includes the paper's thermal-performance winners.
+        # GWP and safety class: Toluene GWP=3 A3 (orc_model.WORKING_FLUIDS confirmed);
+        # Cyclohexane GWP=2 A3 (ibid). CAPEX ~2300 USD/kW (comparable to n-Pentane
+        # balance-of-plant; no published specific figure — stated as approximate in paper).
+        fluids = ['R245fa', 'R1233zd(E)', 'R1234ze(E)', 'n-Pentane', 'Toluene', 'Cyclohexane']
+        fluid_gwp = {'R245fa': 1030, 'R1233zd(E)': 4.5, 'R1234ze(E)': 7, 'n-Pentane': 5,
+                     'Toluene': 3, 'Cyclohexane': 2}
+        fluid_capex = {'R245fa': 2500, 'R1233zd(E)': 2400, 'R1234ze(E)': 2600, 'n-Pentane': 2200,
+                       'Toluene': 2300, 'Cyclohexane': 2300}
 
         class WHROptProblem(Problem):
             def __init__(self):
@@ -295,7 +301,7 @@ def run_nsga2_optimization(engine, output_dir='results', n_gen=200, pop_size=100
                     n_obj=3,
                     n_constr=0,
                     xl=np.array([60, 35, 0, 0, 0.50]),
-                    xu=np.array([145, 45, 30, 3.99, 1.00]),
+                    xu=np.array([145, 45, 30, 5.99, 1.00]),  # 6 fluids: idx 0..5
                 )
 
             def _evaluate(self, X, out, *args, **kwargs):
@@ -308,7 +314,7 @@ def run_nsga2_optimization(engine, output_dir='results', n_gen=200, pop_size=100
                     fluid_idx = int(x[3])
                     load = x[4]
 
-                    fluid_name = fluids[max(0, min(fluid_idx, 3))]
+                    fluid_name = fluids[max(0, min(fluid_idx, 5))]  # 6-fluid set
                     gwp = fluid_gwp[fluid_name]
                     capex_kw = fluid_capex[fluid_name]
 
@@ -335,9 +341,13 @@ def run_nsga2_optimization(engine, output_dir='results', n_gen=200, pop_size=100
                             maintenance = capex * 0.03
                             lifecycle_cost = capex + 20 * maintenance - 20 * annual_savings
 
-                            # Environmental score (GWP × fluid charge mass)
-                            # Approximate charge: 5 kg per kW
-                            env_score = gwp * m_wf * 5
+                            # Environmental score: GWP × refrigerant charge mass.
+                            # Charge mass = 4 kg/kW_net (consistent with TEWI module
+                            # CHARGE_KG_PER_KW = 4.0; Sprouse 2013).
+                            # Previously used gwp * m_wf * 5 where m_wf is a mass
+                            # flow rate (kg/s), giving an odd unit. Corrected here to
+                            # gwp * W_net * 4.0 [kgCO2e_equiv], a static charge proxy.
+                            env_score = gwp * W_net * 4.0
 
                             F[i] = [-W_net, lifecycle_cost, env_score]  # Minimize all
                         else:
@@ -372,7 +382,7 @@ def run_nsga2_optimization(engine, output_dir='results', n_gen=200, pop_size=100
         for i in range(len(pareto_X)):
             x = pareto_X[i]
             fluid_idx = int(x[3])
-            fluid_name = fluids[max(0, min(fluid_idx, 3))]
+            fluid_name = fluids[max(0, min(fluid_idx, 5))]  # 6-fluid set
 
             pareto_results.append({
                 'T_evap_C': x[0],
@@ -413,7 +423,7 @@ def run_nsga2_optimization(engine, output_dir='results', n_gen=200, pop_size=100
         import CoolProp.CoolProp as CP
         from orc_model import ORCSystem
 
-        fluids = ['R245fa', 'R1233zd(E)', 'R1234ze(E)', 'n-Pentane']
+        fluids = ['R245fa', 'R1233zd(E)', 'R1234ze(E)', 'n-Pentane', 'Toluene', 'Cyclohexane']
         results = []
 
         for fluid in tqdm(fluids, desc="Grid Pareto"):
@@ -451,8 +461,10 @@ if __name__ == '__main__':
     from engine_model import S65MEC_Engine, run_engine_analysis
     engine, engine_df = run_engine_analysis()
 
-    # Monte Carlo (fast: ~30 min for 10k samples)
-    run_monte_carlo(engine, n_samples=10000)
+    # Monte Carlo: NOT re-run here (unchanged; existing 05_monte_carlo_results.csv stands).
 
-    # NSGA-II (slower: 2-4 hours for 200 gen × 100 pop)
-    run_nsga2_optimization(engine, n_gen=200, pop_size=100)
+    # NSGA-II: reduced pop/gen for the C1-substantive fix re-run.
+    # Production run used 200 gen × 100 pop; this re-run uses 100 gen × 50 pop
+    # (sufficient to populate the 6-fluid front; stated in paper as verification run).
+    # Increase to n_gen=200, pop_size=100 for final publication run.
+    run_nsga2_optimization(engine, output_dir='results', n_gen=100, pop_size=50)

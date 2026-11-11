@@ -29,9 +29,9 @@ from __future__ import annotations
 import os
 import numpy as np
 import pandas as pd
-import CoolProp.CoolProp as CP
 
 from engine_model import S65MEC_Engine
+from orc_model import ORCSystem          # canonical solver — same as headline 684 kW cycle
 
 
 FLUIDS = ["Toluene", "n-Pentane", "R1233zd(E)", "Cyclohexane"]
@@ -46,50 +46,59 @@ OPERATING_DAYS = 280
 EF_CO2_HFO = 3.114
 BSFC_AUX = 210.0               # g/kWh - displaced genset
 
+# Evaporator temperature sweep — mirrors orc_model.run_orc_analysis exactly.
+# The acid-dew-point floor (150 C) constrains T_evap <= 140 C via the
+# ORCSystem.size_for_heat_source pinch check (T_source_out - pinch = 140 C).
+T_EVAP_RANGE_C = np.arange(60.0, 155.0, 2.5)
+T_ACID_DEW_C = 150.0           # ZareNezhad 2009, HFO @ 3.5% S
 
-def _solve_orc(fluid: str, T_exh_C: float, Q_exh_kW: float,
-               T_cond_C: float) -> dict:
-    """Subcritical ORC solver with fixed component etas and superheat."""
-    T_cond_K = T_cond_C + 273.15
-    T_crit_K = CP.PropsSI("Tcrit", fluid)
-    # Evaporator temperature: limit to 90% of T_crit, below exhaust pinch
-    T_evap_C_max = min(T_exh_C - PINCH_EVAP_K - 15.0, (T_crit_K - 10.0) - 273.15)
-    T_evap_C = max(T_cond_C + 40.0, min(T_evap_C_max, 150.0))
-    T_evap_K = T_evap_C + 273.15
 
-    P_cond = CP.PropsSI("P", "T", T_cond_K, "Q", 0, fluid)
-    h1 = CP.PropsSI("H", "T", T_cond_K, "Q", 0, fluid)
-    s1 = CP.PropsSI("S", "T", T_cond_K, "Q", 0, fluid)
-    P_evap = CP.PropsSI("P", "T", T_evap_K, "Q", 1, fluid)
+def _solve_orc_best(fluid: str, T_exh_C: float, Q_exh_kW: float,
+                    T_cond_C: float) -> dict:
+    """
+    Find the ORC point that maximises W_net using orc_model.ORCSystem.
 
-    h2s = CP.PropsSI("H", "P", P_evap, "S", s1, fluid)
-    h2 = h1 + (h2s - h1) / ETA_PUMP
+    Sweeps T_EVAP_RANGE_C at fixed 5 K superheat, 10 K evaporator pinch,
+    and acid-dew-point floor as the exhaust outlet temperature.  This
+    exactly mirrors orc_model.run_orc_analysis, so results are
+    self-consistent with the headline toluene 684 kW / 16.5% cycle.
 
-    T3_K = min(T_evap_K + SUPERHEAT_C, T_crit_K - 1.0)
-    h3 = CP.PropsSI("H", "T", T3_K, "P", P_evap, fluid)
-    s3 = CP.PropsSI("S", "T", T3_K, "P", P_evap, fluid)
+    Root-cause note: the previous _solve_orc set T_evap = 150 C (no
+    pinch guard), while ORCSystem.size_for_heat_source rejects T_evap >
+    140 C (150 - 10 K pinch = 140 C ceiling).  That 10 C gap produced
+    the 722 vs 684 kW discrepancy (C4).
 
-    h4s = CP.PropsSI("H", "P", P_cond, "S", s3, fluid)
-    h4 = h3 - ETA_TURB * (h3 - h4s)
-
-    w_pump = h2 - h1
-    w_turb = h3 - h4
-    w_net = w_turb - w_pump
-    q_in = h3 - h2
-    if q_in <= 0 or w_net <= 0:
-        raise ValueError("infeasible cycle")
-
-    eta_th = w_net / q_in
-    m_wf = Q_exh_kW * 1000.0 / q_in  # kg/s
-    W_net_kW = m_wf * w_net / 1000.0
-
+    Raises ValueError if no feasible point exists for any T_evap in the
+    sweep range.
+    """
+    orc = ORCSystem(
+        fluid_name=fluid,
+        eta_pump=ETA_PUMP,
+        eta_expander=ETA_TURB,
+        pinch_point_K=PINCH_EVAP_K,
+    )
+    best = None
+    for T_evap_C in T_EVAP_RANGE_C:
+        r = orc.size_for_heat_source(
+            Q_exh_kW, T_exh_C, T_ACID_DEW_C,
+            T_evap_C, T_cond_C,
+            T_superheat_C=SUPERHEAT_C,
+        )
+        if r is None:
+            continue
+        if best is None or r["W_net_kW"] > best["W_net_kW"]:
+            best = r
+    if best is None:
+        raise ValueError(
+            f"No feasible ORC point: fluid={fluid}, T_cond={T_cond_C:.1f} C"
+        )
     return {
         "T_cond_C":   T_cond_C,
-        "P_cond_kPa": P_cond / 1000.0,
-        "P_evap_kPa": P_evap / 1000.0,
-        "eta_th":     eta_th,
-        "W_net_kW":   W_net_kW,
-        "T_evap_C":   T_evap_C,
+        "P_cond_kPa": best["P_cond_kPa"],
+        "P_evap_kPa": best["P_evap_kPa"],
+        "eta_th":     best["eta_thermal"],
+        "W_net_kW":   best["W_net_kW"],
+        "T_evap_C":   best["T_evap_C"],
     }
 
 
@@ -113,8 +122,8 @@ def sweep() -> pd.DataFrame:
     ref_W = {}
     for fluid in FLUIDS:
         try:
-            ref_W[fluid] = _solve_orc(fluid, T_exh_C, Q_exh_kW,
-                                      15.0 + APPROACH_K)["W_net_kW"]
+            ref_W[fluid] = _solve_orc_best(fluid, T_exh_C, Q_exh_kW,
+                                           15.0 + APPROACH_K)["W_net_kW"]
         except Exception:
             ref_W[fluid] = np.nan
 
@@ -122,7 +131,7 @@ def sweep() -> pd.DataFrame:
         T_cond = T_sw + APPROACH_K
         for fluid in FLUIDS:
             try:
-                r = _solve_orc(fluid, T_exh_C, Q_exh_kW, T_cond)
+                r = _solve_orc_best(fluid, T_exh_C, Q_exh_kW, T_cond)
             except Exception:
                 continue
             derating = 100.0 * (1.0 - r["W_net_kW"] / ref_W[fluid]) \
@@ -132,6 +141,7 @@ def sweep() -> pd.DataFrame:
                 "fluid":                  fluid,
                 "T_cond_C":               r["T_cond_C"],
                 "P_cond_kPa":             r["P_cond_kPa"],
+                "T_evap_C":               r["T_evap_C"],
                 "eta_th":                 r["eta_th"],
                 "W_net_kW":               r["W_net_kW"],
                 "power_derating_pct_vs_15C": derating,

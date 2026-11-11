@@ -62,6 +62,65 @@ FUEL_PRICE_USD_PER_T = 550.0
 CARBON_PRICE_USD_PER_T = 55.0  # EU ETS 2025 reference
 
 
+def _build_toluene_rows(env_df: pd.DataFrame, orc_csv_path: str) -> pd.DataFrame:
+    """Construct ORC_Toluene rows for the voyage model.
+
+    Toluene is the paper's hero fluid (canonical: 684 kW, 16.5% at 85% MCR)
+    but is absent from 04_environmental_economic_4E.csv because the
+    environmental model uses fixed-η technology entries. We rebuild toluene rows
+    from the 02b per-fluid ORC results (actual CoolProp-solved cycle points) and
+    scale per-kW emissions using the fluid-independent HFO emission factors
+    already embedded in the R245fa rows of env_df.
+
+    Args:
+        env_df : DataFrame from 04_environmental_economic_4E.csv.
+        orc_csv_path : Path to 02b_orc_optimal_per_fluid.csv.
+
+    Returns:
+        DataFrame of ORC_Toluene rows with the same columns needed by
+        _voyage_weight: W_whr_kW, annual_fuel_saved_tonnes,
+        annual_co2_saved_tonnes, annual_nox_saved_tonnes,
+        annual_sox_saved_tonnes, eedi_improvement_pct, CAPEX_USD.
+    """
+    # Per-kW emission rates from ORC_R245fa rows (fluid-independent, derived
+    # from BSFC_aux=210 g/kWh, annual_hours=6720 h/yr, EF_CO2_HFO=3.114 kg/kg).
+    r245 = env_df[env_df["WHR_technology"] == "ORC_R245fa"].copy()
+    # Use a representative row (rates constant across loads within float noise)
+    ref_row = r245.iloc[len(r245) // 2]
+    co2_per_kW = float(ref_row["annual_co2_saved_tonnes"]) / float(ref_row["W_whr_kW"])
+    fuel_per_kW = float(ref_row["annual_fuel_saved_tonnes"]) / float(ref_row["W_whr_kW"])
+    nox_per_kW = float(ref_row["annual_nox_saved_tonnes"]) / float(ref_row["W_whr_kW"])
+    sox_per_kW = float(ref_row["annual_sox_saved_tonnes"]) / float(ref_row["W_whr_kW"])
+    eedi_per_kW = float(ref_row["eedi_improvement_pct"]) / float(ref_row["W_whr_kW"])
+    CAPEX_PER_KW = 2500.0  # USD/kW, same rate as ORC_R245fa
+
+    # Toluene W_net vs engine load from the full ORC solver (02b CSV)
+    orc_df = pd.read_csv(orc_csv_path)
+    tol = orc_df[orc_df["fluid_key"] == "Toluene"].sort_values("engine_load_pct")
+    loads_02b = tol["engine_load_pct"].values
+    W_02b = tol["W_net_kW"].values
+
+    # Build one row per load point in env_df (using interpolation of 02b data)
+    unique_loads = sorted(r245["Load_pct"].unique())
+    rows = []
+    for load in unique_loads:
+        W = float(np.interp(load, loads_02b, W_02b))
+        rows.append({
+            "Load_pct":                    load,
+            "WHR_technology":              "ORC_Toluene",
+            "Q_available_kW":              float(r245[np.isclose(r245["Load_pct"], load)].iloc[0]["Q_available_kW"]),
+            "W_whr_kW":                    W,
+            "eta_whr":                     W / float(r245[np.isclose(r245["Load_pct"], load)].iloc[0]["Q_available_kW"]),
+            "annual_fuel_saved_tonnes":    W * fuel_per_kW,
+            "annual_co2_saved_tonnes":     W * co2_per_kW,
+            "annual_nox_saved_tonnes":     W * nox_per_kW,
+            "annual_sox_saved_tonnes":     W * sox_per_kW,
+            "eedi_improvement_pct":        W * eedi_per_kW,
+            "CAPEX_USD":                   W * CAPEX_PER_KW,
+        })
+    return pd.DataFrame(rows)
+
+
 def _nearest_load_row(df: pd.DataFrame, tech: str, load_pct: float) -> pd.Series:
     """Return the row closest to the target load for a given WHR tech."""
     sub = df[df["WHR_technology"] == tech]
@@ -154,6 +213,11 @@ def main(output_dir: str = "results") -> None:
     os.makedirs(output_dir, exist_ok=True)
     env_path = os.path.join(output_dir, "04_environmental_economic_4E.csv")
     env_df = pd.read_csv(env_path)
+
+    # Inject ORC_Toluene rows (hero fluid, absent from 04 CSV which uses fixed η).
+    orc_path = os.path.join(output_dir, "02b_orc_optimal_per_fluid.csv")
+    toluene_rows = _build_toluene_rows(env_df, orc_path)
+    env_df = pd.concat([env_df, toluene_rows], ignore_index=True)
 
     sched_path = os.path.join(output_dir, "08_voyage_profile_schedules.csv")
     _write_schedule_table(sched_path)
